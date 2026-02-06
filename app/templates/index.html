@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ISO 29148 Auditor</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        :root {
+            --sidebar-bg: #202123;
+            --main-bg: #343541;
+            --input-bg: #40414f;
+            --text-color: #ececf1;
+            --accent: #10a37f;
+            --user-bubble: #5436DA;
+            --bot-bubble: #444654;
+        }
+        body { margin: 0; font-family: 'Segoe UI', Tahoma, sans-serif; display: flex; height: 100vh; background: var(--main-bg); color: var(--text-color); }
+        
+        /* --- LAYOUT --- */
+        .sidebar-left, .sidebar-right { width: 260px; background: var(--sidebar-bg); display: flex; flex-direction: column; border-right: 1px solid #4d4d4f; }
+        .sidebar-right { border-left: 1px solid #4d4d4f; border-right: none; }
+        .main-chat { flex: 1; display: flex; flex-direction: column; position: relative; }
+
+        /* --- LEFT: SESSIONS --- */
+        .new-chat-btn { padding: 12px; margin: 10px; border: 1px solid #565869; border-radius: 5px; background: transparent; color: white; cursor: pointer; text-align: left; transition: 0.2s; display: flex; align-items: center; gap: 10px; }
+        .new-chat-btn:hover { background: #2A2B32; }
+        .session-list { flex: 1; overflow-y: auto; }
+        .session-item { padding: 12px; margin: 2px 10px; cursor: pointer; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; color: #ccc; }
+        .session-item:hover, .session-item.active { background: #2A2B32; color: white; }
+        .delete-btn { opacity: 0; color: #ff6b6b; cursor: pointer; transition: opacity 0.2s; }
+        .session-item:hover .delete-btn { opacity: 1; }
+
+        /* --- RIGHT: DOCUMENTS --- */
+        .doc-header { padding: 15px; font-weight: bold; border-bottom: 1px solid #4d4d4f; text-align: center; }
+        .doc-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .doc-item { font-size: 0.85em; padding: 8px; background: #2A2B32; margin-bottom: 8px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .doc-item i { color: #ff6b6b; cursor: pointer; }
+        .upload-area { padding: 15px; border-top: 1px solid #4d4d4f; }
+        .upload-btn { width: 100%; padding: 10px; background: #40414f; border: none; color: white; border-radius: 5px; cursor: pointer; }
+        .upload-btn:hover { background: #50515f; }
+
+        /* --- CENTER: CHAT --- */
+        .chat-history { flex: 1; overflow-y: auto; padding: 20px 50px; scroll-behavior: smooth; }
+        .message { margin-bottom: 25px; display: flex; gap: 15px; animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .avatar { width: 30px; height: 30px; border-radius: 4px; display: flex; justify-content: center; align-items: center; flex-shrink: 0; }
+        .avatar.user { background: var(--user-bubble); }
+        .avatar.bot { background: var(--accent); }
+        
+        .msg-content { flex: 1; line-height: 1.6; font-size: 0.95rem; }
+        .msg-content h3 { margin-top: 5px; margin-bottom: 5px; color: #fff; }
+        .msg-content ul { padding-left: 20px; margin: 5px 0; }
+        
+        /* --- INPUT AREA --- */
+        .input-container { padding: 30px 50px; background: var(--main-bg); position: relative; }
+        .input-box { width: 100%; background: var(--input-bg); border: none; padding: 15px; border-radius: 8px; color: white; font-size: 1rem; resize: none; outline: none; box-shadow: 0 0 15px rgba(0,0,0,0.2); font-family: inherit; }
+        .input-box:focus { box-shadow: 0 0 15px rgba(0,0,0,0.4); }
+        #loading { display: none; color: #aaa; margin-top: 8px; font-size: 0.9em; font-style: italic; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar-left">
+        <button class="new-chat-btn" onclick="createNewSession()">
+            <i class="fas fa-plus"></i> New Chat
+        </button>
+        <div class="session-list" id="sessionList"></div>
+    </div>
+
+    <div class="main-chat">
+        <div class="chat-history" id="chatHistory"></div>
+        <div class="input-container">
+            <textarea id="userInput" class="input-box" rows="1" placeholder="Enter requirement or question..." onkeydown="handleEnter(event)"></textarea>
+            <div id="loading">Auditor is analyzing...</div>
+        </div>
+    </div>
+
+    <div class="sidebar-right">
+        <div class="doc-header">
+            <i class="fas fa-file-pdf"></i> Context Docs
+        </div>
+        <div class="doc-list" id="docList">
+            <div style="padding:10px; color:#888; font-size:0.8em; text-align:center;">
+                No user docs.<br>Supervisor knowledge active.
+            </div>
+        </div>
+        <div class="upload-area">
+            <input type="file" id="fileInput" style="display:none" onchange="uploadFile()">
+            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                <i class="fas fa-upload"></i> Upload PDF
+            </button>
+        </div>
+    </div>
+
+<script>
+    let currentSessionId = null;
+
+    // --- INITIALIZATION ---
+    async function init() {
+        await loadSessions();
+        // If no session exists, create one automatically
+        if(!currentSessionId) await createNewSession();
+    }
+    init();
+
+    // --- SESSION LOGIC ---
+    async function loadSessions() {
+        const res = await fetch('/sessions');
+        const sessions = await res.json();
+        const list = document.getElementById('sessionList');
+        list.innerHTML = '';
+        
+        sessions.forEach(s => {
+            const div = document.createElement('div');
+            div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
+            div.innerHTML = `
+                <span onclick="switchSession('${s.id}')" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                    <i class="far fa-comments"></i> ${s.title}
+                </span>
+                <i class="fas fa-trash delete-btn" onclick="deleteSession('${s.id}')"></i>
+            `;
+            list.appendChild(div);
+        });
+
+        // Auto-select first if none selected
+        if(sessions.length > 0 && !currentSessionId) {
+            switchSession(sessions[0].id);
+        }
+    }
+
+    async function createNewSession() {
+        const res = await fetch('/sessions', { method: 'POST' });
+        const s = await res.json();
+        currentSessionId = s.id;
+        await loadSessions();
+        await switchSession(s.id);
+    }
+
+    async function switchSession(id) {
+        currentSessionId = id;
+        
+        // Visual Update
+        document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+        // Re-load sessions to update the "active" class rendered in loadSessions (or manually toggle class here)
+        loadSessions(); 
+
+        await loadHistory(id);
+        await loadDocuments(id);
+    }
+
+    async function deleteSession(id) {
+        if(!confirm("Delete this chat and all its PDFs?")) return;
+        await fetch(`/sessions/${id}`, { method: 'DELETE' });
+        
+        if(currentSessionId === id) currentSessionId = null;
+        await loadSessions();
+        
+        // If we deleted the active one and list is empty, clear UI
+        if(!currentSessionId) {
+            document.getElementById('chatHistory').innerHTML = '';
+            document.getElementById('docList').innerHTML = '';
+            await createNewSession();
+        }
+    }
+
+    // --- CHAT LOGIC ---
+    async function loadHistory(id) {
+        const res = await fetch(`/sessions/${id}/history`);
+        const msgs = await res.json();
+        const box = document.getElementById('chatHistory');
+        box.innerHTML = '';
+        msgs.forEach(m => appendMessage(m.role, m.content));
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById('userInput');
+        const text = input.value.trim();
+        if(!text) return;
+
+        // Optimistic UI update
+        appendMessage('user', text);
+        input.value = '';
+        document.getElementById('loading').style.display = 'block';
+
+        // Check history count BEFORE sending to decide on refresh
+        const existingMsgs = document.querySelectorAll('.message').length;
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('user_message', text);
+
+        try {
+            const res = await fetch('/chat', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            let botText = data.answer;
+            if(data.sources && data.sources.length > 0) {
+                botText += `\n\n*(Sources: ${data.sources.join(', ')})*`;
+            }
+            appendMessage('bot', botText);
+
+            // If this was the first message, refresh session list to show new title
+            if(existingMsgs === 0) {
+                loadSessions();
+            }
+
+        } catch(e) {
+            appendMessage('bot', '**Error:** Could not reach server.');
+        }
+        document.getElementById('loading').style.display = 'none';
+    }
+
+    function appendMessage(role, text) {
+        const box = document.getElementById('chatHistory');
+        const div = document.createElement('div');
+        div.className = 'message';
+        div.innerHTML = `
+            <div class="avatar ${role}">
+                <i class="fas fa-${role==='user'?'user':'robot'}"></i>
+            </div>
+            <div class="msg-content">${marked.parse(text)}</div>
+        `;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+    }
+
+    function handleEnter(e) {
+        if(e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    }
+
+    // --- DOCUMENT LOGIC ---
+    async function loadDocuments(id) {
+        const res = await fetch(`/sessions/${id}/documents`);
+        const data = await res.json();
+        const list = document.getElementById('docList');
+        list.innerHTML = '';
+        
+        if(data.documents.length === 0) {
+            list.innerHTML = '<div style="padding:10px; color:#888; font-size:0.8em; text-align:center;">No user docs.<br>Supervisor knowledge active.</div>';
+            return;
+        }
+
+        data.documents.forEach(doc => {
+            const div = document.createElement('div');
+            div.className = 'doc-item';
+            div.innerHTML = `
+                <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 180px;" title="${doc}">${doc}</span>
+                <i class="fas fa-times" onclick="deleteDocument('${doc}')" title="Remove"></i>
+            `;
+            list.appendChild(div);
+        });
+    }
+
+    async function uploadFile() {
+        const input = document.getElementById('fileInput');
+        if(input.files.length === 0) return;
+        
+        const btn = document.querySelector('.upload-btn');
+        const originalText = btn.innerHTML;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('file', input.files[0]);
+
+        try {
+            await fetch('/upload', { method: 'POST', body: formData });
+            input.value = ''; 
+            // Refresh list immediately
+            await loadDocuments(currentSessionId);
+        } catch(e) {
+            alert("Upload failed.");
+        }
+        btn.innerHTML = originalText;
+    }
+
+    async function deleteDocument(filename) {
+        if(!confirm(`Remove ${filename} from this chat?`)) return;
+        await fetch(`/sessions/${currentSessionId}/documents/${filename}`, { method: 'DELETE' });
+        await loadDocuments(currentSessionId);
+    }
+</script>
+</body>
+</html>
