@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+jinja2
+gpt4all
+chromadb
+sentence-transformers
+pypdf
