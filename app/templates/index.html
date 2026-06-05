@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ISO 29148 Auditor</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        :root {
+            --sidebar-bg: #202123;
+            --main-bg: #343541;
+            --input-bg: #40414f;
+            --text-color: #ececf1;
+            --accent: #10a37f;
+            --user-bubble: #5436DA;
+            --bot-bubble: #444654;
+        }
+        body { margin: 0; font-family: 'Segoe UI', Tahoma, sans-serif; display: flex; height: 100vh; background: var(--main-bg); color: var(--text-color); overflow: hidden;}
+
+        /* --- LAYOUT --- */
+        .sidebar-left, .sidebar-right { width: 260px; background: var(--sidebar-bg); display: flex; flex-direction: column; border-right: 1px solid #4d4d4f; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); position: relative; flex-shrink: 0;}
+        .sidebar-right { border-left: 1px solid #4d4d4f; border-right: none; }
+        .main-chat { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0;}
+
+        /* --- COLLAPSED STATES --- */
+        .sidebar-left.collapsed { width: 0px; border-right: none; overflow: hidden; }
+        .sidebar-right.collapsed { width: 0px; border-left: none; overflow: hidden;}
+
+        /* --- COLLAPSE TOGGLE BUTTONS --- */
+        .sidebar-toggle {
+            position: absolute;
+            top: 20px;
+            width: 24px;
+            height: 24px;
+            background: var(--input-bg);
+            border: 1px solid #565869;
+            color: var(--text-color);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            z-index: 1000;
+            transition: background 0.2s, color 0.2s;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+        }
+        .sidebar-toggle:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        #toggle-left { left: 10px; position: absolute; top: 20px; z-index: 1001; }
+        #toggle-right { right: 10px; position: absolute; top: 20px; z-index: 1001; }
+        
+        /* --- LEFT: SESSIONS --- */
+        .new-chat-btn { padding: 12px; margin: 10px; border: 1px solid #565869; border-radius: 5px; background: transparent; color: white; cursor: pointer; text-align: left; transition: 0.2s; display: flex; align-items: center; gap: 10px; }
+        .new-chat-btn:hover { background: #2A2B32; }
+        .session-list { flex: 1; overflow-y: auto; }
+        .session-item { padding: 12px; margin: 2px 10px; cursor: pointer; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; color: #ccc; }
+        .session-item:hover, .session-item.active { background: #2A2B32; color: white; }
+        .delete-btn { opacity: 0; color: #ff6b6b; cursor: pointer; transition: opacity 0.2s; }
+        .session-item:hover .delete-btn { opacity: 1; }
+
+        /* --- RIGHT: DOCUMENTS --- */
+        .doc-header { padding: 15px; font-weight: bold; border-bottom: 1px solid #4d4d4f; text-align: center; }
+        .doc-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .doc-item { font-size: 0.85em; padding: 8px; background: #2A2B32; margin-bottom: 8px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .doc-item i { color: #ff6b6b; cursor: pointer; }
+        .upload-area { padding: 15px; border-top: 1px solid #4d4d4f; }
+        .upload-btn { width: 100%; padding: 10px; background: #40414f; border: none; color: white; border-radius: 5px; cursor: pointer; }
+        .upload-btn:hover { background: #50515f; }
+
+        /* --- CENTER: CHAT --- */
+        .chat-history { flex: 1; overflow-y: auto; padding: 20px 50px; scroll-behavior: smooth; }
+        .message { margin-bottom: 25px; display: flex; gap: 15px; animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .avatar { width: 30px; height: 30px; border-radius: 4px; display: flex; justify-content: center; align-items: center; flex-shrink: 0; }
+        .avatar.user { background: var(--user-bubble); }
+        .avatar.bot { background: var(--accent); }
+        
+        .msg-content { flex: 1; line-height: 1.6; font-size: 0.95rem; }
+        .msg-content h3 { margin-top: 5px; margin-bottom: 5px; color: #fff; }
+        .msg-content ul { padding-left: 20px; margin: 5px 0; }
+        
+        /* --- INPUT AREA --- */
+        .input-container { padding: 30px 50px; background: var(--main-bg); position: relative; }
+        .input-box { width: 100%; background: var(--input-bg); border: none; padding: 15px; border-radius: 8px; color: white; font-size: 1rem; resize: none; outline: none; box-shadow: 0 0 15px rgba(0,0,0,0.2); font-family: inherit; }
+        .input-box:focus { box-shadow: 0 0 15px rgba(0,0,0,0.4); }
+        #loading { display: none; color: #aaa; margin-top: 8px; font-size: 0.9em; font-style: italic; }
+
+        /* --- MODE SELECTOR --- */
+        .mode-selector { display: flex; gap: 10px; margin-bottom: 12px; }
+        .mode-btn { background: #40414f; color: #ccc; border: 1px solid #565869; padding: 6px 15px; border-radius: 15px; cursor: pointer; font-size: 0.85em; transition: all 0.2s; }
+        .mode-btn:hover { background: #50515f; }
+        .mode-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+        /* --- FEEDBACK BUTTONS --- */
+        .feedback-btns { margin-top: 10px; display: flex; gap: 8px; opacity: 0.5; transition: opacity 0.2s; }
+        .message:hover .feedback-btns { opacity: 1; }
+        .f-btn { background: transparent; border: 1px solid #565869; color: #ccc; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 0.8em; transition: 0.2s; }
+        .f-btn:hover { background: #40414f; color: white; }
+        .f-btn.active-up { background: #10a37f; border-color: #10a37f; color: white; }
+        .f-btn.active-down { background: #ff6b6b; border-color: #ff6b6b; color: white; }
+
+        /* --- MACRO PROCESS STEPPER --- */
+        .stepper-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 50px;
+            background: #2A2B32;
+            border-bottom: 1px solid #4d4d4f;
+        }
+        .step {
+            flex: 1;
+            text-align: center;
+            color: #888;
+            font-size: 0.9em;
+            font-weight: bold;
+            cursor: pointer;
+            padding: 10px;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s ease;
+        }
+        .step:hover {
+            color: #ccc;
+        }
+        .step.active {
+            color: var(--accent);
+            border-bottom: 3px solid var(--accent);
+        }
+        .step i {
+            margin-right: 5px;
+        }
+        .step-arrow {
+            color: #565869;
+            font-size: 0.8em;
+        }
+        
+        /* --- TOAST NOTIFICATIONS --- */
+        #toast-container {
+            position: fixed;
+            bottom: 25px;
+            right: 25px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            pointer-events: none;
+        }
+        .toast {
+            min-width: 250px;
+            max-width: 350px;
+            padding: 15px 20px;
+            border-radius: 8px;
+            color: white;
+            font-size: 0.95em;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            animation: slideInRight 0.4s cubic-bezier(0.25, 0.8, 0.25, 1) forwards;
+            transition: opacity 0.3s ease, transform 0.3s ease;
+            pointer-events: auto;
+        }
+        .toast i { font-size: 1.2em; }
+        
+        .toast.success { background-color: var(--main-bg); border-left: 5px solid var(--accent); }
+        .toast.success i { color: var(--accent); }
+        
+        .toast.error { background-color: var(--main-bg); border-left: 5px solid #ff6b6b; }
+        .toast.error i { color: #ff6b6b; }
+        
+        .toast.info { background-color: var(--main-bg); border-left: 5px solid #3b82f6; }
+        .toast.info i { color: #3b82f6; }
+        
+        .toast.fade-out { opacity: 0; transform: translateX(20px); }
+        
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* --- DRAG & DROP ZONE --- */
+        .upload-area { 
+            padding: 20px 15px; 
+            border-top: 1px solid #4d4d4f; 
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            background: var(--sidebar-bg);
+            border: 2px dashed transparent; /* Platzhalter für den Hover-Effekt */
+            margin: 10px;
+            border-radius: 8px;
+        }
+        
+        /* Dieser Zustand wird aktiviert, wenn eine Datei über das Feld gezogen wird */
+        .upload-area.dragover {
+            background: rgba(16, 163, 127, 0.1); /* Leichtes Grün */
+            border: 2px dashed var(--accent); /* Grüne, gestrichelte Linie */
+            transform: scale(1.02); /* Plopt leicht auf */
+        }
+
+        .upload-btn { 
+            width: 100%; 
+            padding: 8px; 
+            background: #40414f; 
+            border: 1px solid #565869; 
+            color: white; 
+            border-radius: 5px; 
+            cursor: pointer; 
+            margin-top: 10px;
+            transition: 0.2s;
+        }
+        .upload-btn:hover { background: #50515f; }
+    </style>
+</head>
+<body>
+    <div id="toast-container"></div>
+    <div class="sidebar-left">
+        <button class="new-chat-btn" onclick="createNewSession()">
+            <i class="fas fa-plus"></i> New Chat
+        </button>
+        <div class="session-list" id="sessionList"></div>
+    </div>
+
+    <div class="main-chat">
+        <button id="toggle-left" class="sidebar-toggle" onclick="toggleLeftSidebar()" title="Switch Navigation">
+            <i class="fas fa-chevron-left" id="icon-left"></i>
+        </button>
+        <button id="toggle-right" class="sidebar-toggle" onclick="toggleRightSidebar()" title="Switch Dashboard" style="right: 10px;">
+            <i class="fas fa-chevron-right" id="icon-right"></i>
+        </button>
+        <div class="stepper-container">
+            <div class="step active" id="step-Asset" onclick="setProcessState('Asset')">
+                <i class="fas fa-shield-alt"></i> 1. Assets
+            </div>
+            <i class="fas fa-chevron-right step-arrow"></i>
+            <div class="step" id="step-Threat" onclick="setProcessState('Threat')">
+                <i class="fas fa-biohazard"></i> 2. Threats
+            </div>
+            <i class="fas fa-chevron-right step-arrow"></i>
+            <div class="step" id="step-Goal" onclick="setProcessState('Goal')">
+                <i class="fas fa-bullseye"></i> 3. Security Goals
+            </div>
+            <i class="fas fa-chevron-right step-arrow"></i>
+            <div class="step" id="step-Req" onclick="setProcessState('Req')">
+                <i class="fas fa-check"></i> 4. Security Requirements
+            </div>
+        </div>
+        <div class="chat-history" id="chatHistory"></div>
+        <div class="input-container">
+            <div class="mode-selector">
+                <button class="mode-btn active" id="mode-elicitation" onclick="setMode('elicitation')">
+                    <i class="fas fa-magic"></i> Requirements Assistant (Interactive)
+                </button>
+                <button class="mode-btn" id="mode-qa" onclick="setMode('qa')">
+                    <i class="fas fa-search"></i> ISO 29148 Review (Optional Check)
+                </button>
+            </div>
+            
+            <div style="position: relative; display: flex; align-items: flex-end; background: var(--input-bg); border-radius: 8px; box-shadow: 0 0 15px rgba(0,0,0,0.2);">
+                <textarea id="userInput" class="input-box" rows="1" placeholder="Enter an idea or topic (e.g., 'I need a secure login')..." oninput="autoResize(this)" onkeydown="handleEnter(event)" style="box-shadow: none; padding-right: 50px; overflow-y: hidden;"></textarea>
+                
+                <button id="sendBtn" onclick="sendMessage()" style="position: absolute; right: 10px; bottom: 12px; background: transparent; border: none; color: var(--accent); font-size: 1.2rem; cursor: pointer; transition: 0.2s;">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+            
+            <div id="loading"><i class="fas fa-spinner fa-spin"></i> Auditor is analyzing...</div>
+        </div>
+    </div>
+
+    <div class="sidebar-right">
+        <div class="doc-header">
+            <i class="fas fa-file-pdf"></i> Context Docs
+        </div>
+        <div class="doc-list" id="docList">
+            <div style="padding:10px; color:#888; font-size:0.8em; text-align:center;">
+                No user docs.<br>Supervisor knowledge active.
+            </div>
+        </div>
+        <div class="doc-header" style="border-top: 1px solid #4d4d4f; margin-top: 10px;">
+            <i class="fas fa-chart-pie"></i> Project Dashboard
+        </div>
+        <div class="doc-list" id="artifactList" style="flex: 1.5; background: #2A2B32; margin: 10px; border-radius: 5px; padding: 10px; overflow-y: auto;">
+        </div>
+        <div class="upload-area" id="dropZone">
+            <input type="file" id="fileInput" style="display:none" accept=".pdf" onchange="uploadFile()">
+            
+            <i class="fas fa-cloud-upload-alt" style="font-size: 2em; margin-bottom: 8px; color: #888; pointer-events: none;"></i>
+            <p style="margin: 0; font-size: 0.85em; color: #ccc; pointer-events: none;">
+                drop PDF here<br>or
+            </p>
+            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                <i class="fas fa-folder-open"></i> Search for
+            </button>
+        </div>
+    </div>
+
+<script>
+    let currentSessionId = null;
+    let currentMode = 'qa'; // Default Modus
+    let currentProcessState = 'Asset';
+
+    function setProcessState(state) {
+        currentProcessState = state;
+        
+        // Reset all steps
+        document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+        
+        // Activate selected step
+        document.getElementById(`step-${state}`).classList.add('active');
+        
+        // Small Bot Message to indicate context switch
+        appendMessage('bot', `*Switched context to: **${state} Modeling***. What would you like to discuss?`);
+    }
+
+    // Function for switching the mode in UI
+    function setMode(mode) {
+        currentMode = mode;
+        document.getElementById('mode-qa').classList.remove('active');
+        document.getElementById('mode-elicitation').classList.remove('active');
+        document.getElementById(`mode-${mode}`).classList.add('active');
+        
+        const input = document.getElementById('userInput');
+        if(mode === 'qa') {
+            input.placeholder = "Enter requirement to audit (e.g., 'System must be secure')...";
+        } else {
+            input.placeholder = "Enter an idea or topic (e.g., 'I need a secure login')...";
+        }
+    }
+
+    function showToast(message, type = 'info') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        
+        let icon = 'fa-info-circle';
+        if (type === 'success') icon = 'fa-check-circle';
+        if (type === 'error') icon = 'fa-exclamation-circle';
+        
+        toast.innerHTML = `<i class="fas ${icon}"></i> <span>${message}</span>`;
+        container.appendChild(toast);
+        
+        setTimeout(() => {
+            toast.classList.add('fade-out');
+            setTimeout(() => toast.remove(), 300);
+        }, 3500);
+    }
+
+    // --- INITIALIZATION ---
+    async function init() {
+        await loadSessions();
+        // If no session exists, create one automatically
+        if(!currentSessionId) await createNewSession();
+    }
+    init();
+
+    // --- SESSION LOGIC ---
+    async function loadSessions() {
+        const res = await fetch('/sessions');
+        const sessions = await res.json();
+        const list = document.getElementById('sessionList');
+        list.innerHTML = '';
+        
+        sessions.forEach(s => {
+            const div = document.createElement('div');
+            div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
+            div.innerHTML = `
+                <span onclick="switchSession('${s.id}')" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${s.title}">
+                    <i class="far fa-comments"></i> ${s.title}
+                </span>
+                <div class="session-actions" style="display: flex; gap: 8px;">
+                    <i class="fas fa-pen edit-btn" onclick="renameSession('${s.id}', '${s.title.replace(/'/g, "\\'")}', event)" style="opacity:0; cursor:pointer; font-size:0.85em; transition:0.2s;" title="Rename Chat"></i>
+                    <i class="fas fa-trash delete-btn" onclick="deleteSession('${s.id}')" style="opacity:0; transition:0.2s;"></i>
+                </div>
+            `;
+            div.onmouseenter = () => {
+                div.querySelector('.edit-btn').style.opacity = '0.6';
+                div.querySelector('.delete-btn').style.opacity = '1';
+            };
+            div.onmouseleave = () => {
+                div.querySelector('.edit-btn').style.opacity = '0';
+                div.querySelector('.delete-btn').style.opacity = '0';
+            };
+            
+            div.querySelector('.edit-btn').onmouseenter = (e) => e.target.style.opacity = '1';
+            div.querySelector('.edit-btn').onmouseleave = (e) => e.target.style.opacity = '0.6';
+
+            list.appendChild(div);
+        });
+
+        // Auto-select first if none selected
+        if(sessions.length > 0 && !currentSessionId) {
+            switchSession(sessions[0].id);
+        }
+    }
+
+    async function createNewSession() {
+        const res = await fetch('/sessions', { method: 'POST' });
+        const s = await res.json();
+        currentSessionId = s.id;
+        await loadSessions();
+        await switchSession(s.id);
+    }
+
+    async function switchSession(id) {
+        currentSessionId = id;
+        
+        // Visual Update
+        document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+        // Re-load sessions to update the "active" class rendered in loadSessions (or manually toggle class here)
+        loadSessions(); 
+
+        await loadHistory(id);
+        await loadDocuments(id);
+        await loadArtifacts(id);
+    }
+
+    async function deleteSession(id) {
+        if(!confirm("Delete this chat and all its PDFs?")) return;
+        await fetch(`/sessions/${id}`, { method: 'DELETE' });
+        
+        if(currentSessionId === id) currentSessionId = null;
+        await loadSessions();
+        
+        // If we deleted the active one and list is empty, clear UI
+        if(!currentSessionId) {
+            document.getElementById('chatHistory').innerHTML = '';
+            document.getElementById('docList').innerHTML = '';
+            await createNewSession();
+        }
+    }
+
+    async function renameSession(id, oldTitle, event) {
+        event.stopPropagation();
+        
+        const newTitle = prompt("Update the chat name:", oldTitle);
+        
+        if (newTitle === null || newTitle.trim() === "") return;
+
+        const formData = new FormData();
+        formData.append('title', newTitle.trim());
+
+        try {
+            const res = await fetch(`/sessions/${id}/rename`, { method: 'POST', body: formData });
+            if (res.ok) {
+                await loadSessions();
+                showToast("Chat successfully renamed!", "success");
+            }
+        } catch(e) {
+            showToast("Error renaming the chat", "error");
+        }
+    }
+
+    // --- CHAT LOGIC ---
+    async function loadHistory(id) {
+        const res = await fetch(`/sessions/${id}/history`);
+        const msgs = await res.json();
+        const box = document.getElementById('chatHistory');
+        box.innerHTML = '';
+        
+        if (msgs.length === 0) {
+            box.innerHTML = `
+                <div id="emptyState" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #888; text-align: center; animation: fadeIn 0.5s ease;">
+                    <div style="background: rgba(16, 163, 127, 0.1); padding: 20px; border-radius: 50%; margin-bottom: 20px;">
+                        <i class="fas fa-robot" style="font-size: 3rem; color: var(--accent);"></i>
+                    </div>
+                    <h2 style="color: #ececf1; margin-bottom: 10px;">Welcome to the Security Architect!</h2>
+                    <p style="max-width: 450px; line-height: 1.6;">
+                        I help you define ISO 29148-compliant security requirements.<br><br>
+                        Upload a <strong>system document (PDF)</strong> on the right or select the process <strong>'1. Assets'</strong> to start interactively!
+                    </p>
+                </div>
+            `;
+        } else {
+            msgs.forEach(m => appendMessage(m.role, m.content));
+        }
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById('userInput');
+        const text = input.value.trim();
+        if(!text) return;
+
+        const existingMsgs = document.querySelectorAll('.message').length;
+        const sendBtn = document.getElementById('sendBtn');
+
+        input.disabled = true;
+        sendBtn.disabled = true;
+        document.getElementById('loading').style.display = 'block';
+
+        // Optimistic UI update
+        appendMessage('user', text);
+        input.value = '';
+        input.style.height = 'auto';
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('user_message', text);
+        formData.append('intent', currentMode);
+        formData.append('process_state', currentProcessState);
+
+        try {
+            const res = await fetch('/chat', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            let botText = data.answer;
+            if(data.sources && data.sources.length > 0) {
+                botText += `\n\n*(Sources: ${data.sources.join(', ')})*`;
+            }
+            appendMessage('bot', botText);
+
+            // If this was the first message, refresh session list to show new title
+            if(existingMsgs === 0) {
+                loadSessions();
+            }
+
+        } catch(e) {
+            appendMessage('bot', '**Error:** Could not reach server.');
+        } finally {
+            document.getElementById('loading').style.display = 'none';
+            input.disabled = false;
+            sendBtn.disabled = false;
+            input.focus();
+        }
+    }
+
+    function appendMessage(role, text) {
+        const box = document.getElementById('chatHistory');
+
+        const emptyState = document.getElementById('emptyState');
+        if (emptyState) emptyState.remove();
+
+        const div = document.createElement('div');
+        div.className = 'message';
+        
+        let feedbackHtml = '';
+        if(role === 'bot') {
+            const safeText = encodeURIComponent(text).replace(/'/g, "%27");
+            feedbackHtml = `
+                <div style="margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap;">
+                    <span style="font-size: 0.8em; color: #888; align-self: center;">Save as:</span>
+                    <button class="f-btn" onclick="saveArtifact('Asset', '${safeText}')"><i class="fas fa-shield-alt"></i> Asset</button>
+                    <button class="f-btn" onclick="saveArtifact('Threat', '${safeText}')"><i class="fas fa-biohazard"></i> Threat</button>
+                    <button class="f-btn" onclick="saveArtifact('Goal', '${safeText}')"><i class="fas fa-bullseye"></i> Goal</button>
+                    <button class="f-btn" onclick="saveArtifact('Req', '${safeText}')"><i class="fas fa-check"></i> Req</button>
+                </div>
+            `;
+        }
+
+        div.innerHTML = `
+            <div class="avatar ${role}">
+                <i class="fas fa-${role==='user'?'user':'robot'}"></i>
+            </div>
+            <div class="msg-content">
+                ${marked.parse(text)}
+                ${feedbackHtml}
+            </div>
+        `;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+    }
+
+    async function sendFeedback(btn, rating, encodedText) {
+        const container = btn.parentElement;
+        container.querySelectorAll('.f-btn').forEach(b => b.className = 'f-btn'); // reset
+        btn.classList.add(rating === 'up' ? 'active-up' : 'active-down');
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('bot_message', decodeURIComponent(encodedText));
+        formData.append('rating', rating);
+
+        try {
+            await fetch('/feedback', { method: 'POST', body: formData });
+        } catch(e) {
+            console.error("Feedback konnte nicht gesendet werden", e);
+        }
+    }
+
+    function handleEnter(e) {
+        if(e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    }
+
+    // --- DOCUMENT LOGIC ---
+    async function loadDocuments(id) {
+        const res = await fetch(`/sessions/${id}/documents`);
+        const data = await res.json();
+        const list = document.getElementById('docList');
+        
+        list.innerHTML = ''; 
+
+        if(data.documents.length === 0) {
+            list.innerHTML = '<div style="padding:10px; color:#888; font-size:0.8em; text-align:center;">No user docs.<br>Supervisor knowledge active.</div>';
+            return;
+        }
+
+        data.documents.forEach(doc => {
+            const displayName = doc.includes('_') ? doc.split('_').slice(1).join('_') : doc;
+        
+            const div = document.createElement('div');
+            div.className = 'doc-item';
+            div.innerHTML = `
+                <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 150px;" title="${doc}">${displayName}</span>
+                <i class="fas fa-times" onclick="deleteDocument('${doc}')"></i>
+            `;
+            list.appendChild(div);
+        });
+    }
+
+    async function scanDocument(filename) {
+        // Show loading indikator
+        document.getElementById('loading').innerText = `Scanning ${filename} for artifacts...`;
+        document.getElementById('loading').style.display = 'block';
+
+        try {
+            const res = await fetch(`/sessions/${currentSessionId}/scan/${filename}`, { method: 'POST' });
+            const data = await res.json();
+            
+            showToast(`Scan complete! Found and imported ${data.found_and_saved} artifacts.`, "success");
+            
+            await loadArtifacts(currentSessionId);
+        } catch(e) {
+            showToast("Scan failed.", "error");
+        }
+        
+        // Reset loading indiciator
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('loading').innerText = 'Auditor is analyzing...';
+    }
+
+    async function uploadFile() {
+        const input = document.getElementById('fileInput');
+        if(input.files.length === 0) return;
+        
+        const btn = document.querySelector('.upload-btn');
+        const originalText = btn.innerHTML;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+        btn.disabled = true;
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('file', input.files[0]);
+
+        try {
+            const res = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            input.value = ''; 
+            
+            await loadDocuments(currentSessionId);
+            
+            appendMessage('bot', `✅ **Knowledge basis updated:** The file \`${data.filename}\` has been successfully uploaded and is now available as background knowledge.\n\n🔍 **AI Analysis:** I am scanning the document in the background for artifacts. Your dashboard will update automatically when I find something.`);
+            
+            startArtifactPolling();
+            
+        } catch(e) {
+            showToast("Upload failed.", "error");
+        }
+        
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+
+    function startArtifactPolling() {
+        let attempts = 0;
+        const interval = setInterval(async () => {
+            attempts++;
+            await loadArtifacts(currentSessionId);
+            if(attempts >= 24) clearInterval(interval);
+        }, 5000);
+    }
+
+    async function deleteDocument(filename) {
+        if(!confirm(`Remove ${filename} from this chat?`)) return;
+        await fetch(`/sessions/${currentSessionId}/documents/${filename}`, { method: 'DELETE' });
+        await loadDocuments(currentSessionId);
+    }
+
+    async function saveArtifact(type, encodedContent) {
+        let content = decodeURIComponent(encodedContent);
+        
+        // --- INTELLIGENT EXTRACTION ---
+        
+        // Case A: Audit-Report
+        if (content.includes("Improved Proposal")) {
+            const parts = content.split("Improved Proposal");
+            content = parts[parts.length - 1].trim();
+        } 
+        // Case B: Elicitation-Mode
+        else if (content.includes("Acknowledge:")) {
+            const parts = content.split("Acknowledge:");
+            content = parts[1].split("\n")[0].trim();
+        }
+
+        // --- CLEANUP ---
+        content = content.replace(/[#*`]/g, '');
+        content = content.replace(/<[^>]*>?/gm, '');
+        content = content.trim();
+
+        if(content.length > 250) content = content.substring(0, 250) + '...';
+
+        const formData = new FormData();
+        formData.append('session_id', currentSessionId);
+        formData.append('artifact_type', type);
+        formData.append('content', content);
+
+        try {
+            const res = await fetch('/artifacts', { method: 'POST', body: formData });
+            if (res.ok) {
+                await loadArtifacts(currentSessionId);
+                
+                showToast(`✅ Artifact successfully saved to the dashboard!`, "success");
+            }
+        } catch(e) {
+            console.error("Speichern fehlgeschlagen", e);
+        }
+    }
+
+    let currentArtifactFilter = 'all';
+
+    function filterArtifacts(type) {
+        currentArtifactFilter = type;
+        loadArtifacts(currentSessionId);
+    }
+
+    function useArtifact(content) {
+        const input = document.getElementById('userInput');
+        input.value = `Regarding the artifact "${content}": `;
+        input.focus();
+    }
+
+    async function loadArtifacts(id) {
+        const res = await fetch(`/sessions/${id}/artifacts`);
+        const data = await res.json();
+        const list = document.getElementById('artifactList');
+        list.innerHTML = `
+            <div style="margin-bottom:10px; display:flex; gap:5px; flex-wrap:wrap;">
+                <button class="mode-btn ${currentArtifactFilter==='all'?'active':''}" onclick="filterArtifacts('all')" style="font-size:0.7em; padding:3px 8px;">All</button>
+                <button class="mode-btn ${currentArtifactFilter==='Asset'?'active':''}" onclick="filterArtifacts('Asset')" style="font-size:0.7em; padding:3px 8px;">Assets</button>
+                <button class="mode-btn ${currentArtifactFilter==='Threat'?'active':''}" onclick="filterArtifacts('Threat')" style="font-size:0.7em; padding:3px 8px;">Threats</button>
+                <button class="mode-btn ${currentArtifactFilter==='Goal'?'active':''}" onclick="filterArtifacts('Goal')" style="font-size:0.7em; padding:3px 8px;">Goals</button>
+                <button class="mode-btn ${currentArtifactFilter==='Req'?'active':''}" onclick="filterArtifacts('Req')" style="font-size:0.7em; padding:3px 8px;">Reqs</button>
+            </div>
+        `;
+        
+        const filtered = data.artifacts.filter(a => currentArtifactFilter === 'all' || a.type === currentArtifactFilter);
+
+        if(filtered.length === 0) {
+            list.innerHTML += '<div style="color:#888; font-size:0.8em; text-align:center;">Keine Artefakte gefunden.</div>';
+            return;
+        }
+
+        const icons = { 'Asset': '🛡️', 'Threat': '⚠️', 'Goal': '🎯', 'Req': '✅' };
+        filtered.forEach(art => {
+            const div = document.createElement('div');
+            div.className = "artifact-card";
+            div.style = "position: relative; font-size: 0.85em; padding: 8px; background: #343541; margin-bottom: 8px; border-radius: 4px; border-left: 3px solid var(--accent); cursor: pointer;";
+            
+            div.onclick = () => useArtifact(art.content);
+            
+            div.innerHTML = `
+                <i class="fas fa-trash-alt delete-btn-hover" style="position: absolute; right: 10px; top: 10px; color: #ff6b6b; opacity: 0.3; transition: 0.2s;" onclick="deleteArtifact(${art.id}, event)" title="Artefakt entfernen"></i>
+                <strong>${icons[art.type] || '📌'} ${art.type}</strong><br>
+                <span style="color: #ccc; display: block; margin-top: 4px; padding-right: 20px;">${art.content}</span>
+            `;
+            
+            div.onmouseenter = () => div.querySelector('.delete-btn-hover').style.opacity = '1';
+            div.onmouseleave = () => div.querySelector('.delete-btn-hover').style.opacity = '0.3';
+
+            list.appendChild(div);
+        });
+    }
+
+    async function deleteArtifact(id, event) {
+        event.stopPropagation(); 
+        
+        if(!confirm("Möchtest du dieses Artefakt wirklich aus dem Dashboard entfernen?")) return;
+
+        try {
+            const res = await fetch(`/artifacts/${id}`, { method: 'DELETE' });
+            if (res.ok) {
+                await loadArtifacts(currentSessionId);
+            }
+        } catch(e) {
+            console.error("Fehler beim Löschen des Artefakts:", e);
+        }
+    }
+
+    function autoResize(textarea) {
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px'; 
+    }
+
+    // --- DRAG & DROP LOGIC ---
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, preventDefaults, false);
+        document.body.addEventListener(eventName, preventDefaults, false);
+    });
+
+    function preventDefaults(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        let dt = e.dataTransfer;
+        let files = dt.files;
+
+        if (files && files.length > 0) {
+            fileInput.files = files;
+            uploadFile(); 
+        }
+    });
+
+    // --- SIDEBAR COLLAPSE LOGIC ---
+    function toggleLeftSidebar() {
+        const sidebar = document.querySelector('.sidebar-left');
+        const icon = document.getElementById('icon-left');
+        
+        sidebar.classList.toggle('collapsed');
+        
+        if (sidebar.classList.contains('collapsed')) {
+            icon.className = 'fas fa-chevron-right';
+            showToast("Hide left sidebar", "info");
+        } else {
+            icon.className = 'fas fa-chevron-left';
+        }
+    }
+
+    function toggleRightSidebar() {
+        const sidebar = document.querySelector('.sidebar-right');
+        const icon = document.getElementById('icon-right');
+        
+        sidebar.classList.toggle('collapsed');
+        
+        if (sidebar.classList.contains('collapsed')) {
+            icon.className = 'fas fa-chevron-left';
+            showToast("Hide right sidebar", "info");
+        } else {
+            icon.className = 'fas fa-chevron-right';
+        }
+    }
+</script>
+</body>
+</html>
