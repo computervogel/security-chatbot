@@ -1,3 +1,19 @@
 venv/
 uploaded_docs/
 chat_history.db
+__pycache__/
+*.pyc
+
+# Local vector DB - rebuilt automatically on first run (see app/core/ingestion.py's
+# ingest_supervisor_docs()); can end up containing chunks of whatever gets uploaded
+# during local testing/use, so it must not be published either.
+chroma_db/
+
+# Personal / study data - this repo is public on GitHub, these must never be published.
+probanden_daten/
+experten_review_artefakte.txt
+export_expert_review.py
+
+# Local debug tooling and generated test fixtures - not needed to run the bot.
+scripts/
+Security_Requirements_Test.pdf
