@@ -49,7 +49,7 @@ scripts/debug/          # small standalone scripts used during development
 
 - Python 3.12+ (developed and tested on Windows; should work on macOS/Linux as-is)
 - ~2 GB free disk space for the LLM (downloaded automatically on first run)
-- A GPU is optional — the app auto-detects and uses one if available (NVIDIA via CUDA, AMD/Intel via Vulkan, Apple Silicon via Metal) and otherwise falls back to CPU
+- An NVIDIA GPU (CUDA) or Apple Silicon (Metal) is optional and used automatically if available; otherwise the app runs on CPU, which is also what it uses on AMD/Intel GPUs (see below)
 
 ## Setup
 
@@ -78,19 +78,18 @@ scripts/debug/          # small standalone scripts used during development
 
 4. **(Optional) Enable GPU acceleration**
 
-   The app auto-detects a GPU and uses it automatically - no configuration needed:
-
-   - **AMD / Intel GPUs (Windows/Linux)** and **NVIDIA GPUs without the CUDA runtime installed** use Vulkan (via GPT4All's Kompute backend) out of the box, with no extra install step.
-   - **Apple Silicon (M1/M2/M3/M4)** uses Metal out of the box.
-   - **NVIDIA GPUs** additionally get faster native CUDA support if you install the CUDA-enabled extras (no separate CUDA Toolkit install needed - this pulls the matching runtime via pip):
+   - **Apple Silicon (M1/M2/M3/M4)** uses Metal automatically, no setup needed.
+   - **NVIDIA GPUs** get native CUDA support if you install the CUDA-enabled extras (no separate CUDA Toolkit install needed - this pulls the matching runtime via pip):
 
      ```bash
      pip install "gpt4all[cuda]"
      ```
 
-     Without this, an NVIDIA GPU still gets used via the Vulkan fallback above - this step just makes it faster.
+     Without this, the app runs on CPU instead.
 
-   Without any supported GPU, the app runs on CPU automatically.
+   - **AMD / Intel GPUs**: the app deliberately runs on CPU rather than these GPUs. GPT4All supports them via a Vulkan compatibility backend (Kompute), but it isn't a tuned backend like CUDA/Metal - benchmarked on an AMD Radeon 880M (integrated GPU), it generated tokens roughly **10x slower** than CPU on the same machine. CPU is the faster, safer default here.
+
+   Without CUDA or Metal, the app runs on CPU automatically - no configuration needed.
 
 ## Running the app
 

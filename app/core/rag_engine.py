@@ -13,14 +13,27 @@ Two response-generating entry points are used by the API layer:
 `scan_full_document` is a separate, cheaper extraction pass used when a PDF is
 uploaded, to auto-suggest artifacts from its text.
 """
+import os
 import sys
 import time
 import json
 import ast
 import re
 import random
+import threading
+import contextlib
+from contextlib import ExitStack
 
 from gpt4all import GPT4All
+try:
+    # True only if the optional `pip install "gpt4all[cuda]"` extras (the NVIDIA cudart/cublas
+    # runtime) are importable at all. Used to skip attempting device="cuda" outright when
+    # they're definitely not installed - saves a doomed attempt, though not sufficient on its
+    # own (see _suppress_native_stderr: a present-but-mismatched runtime version can still make
+    # the actual attempt fail).
+    from gpt4all._pyllmodel import cuda_found
+except ImportError:
+    cuda_found = True  # unknown on this gpt4all version - fall back to always attempting cuda
 
 from app.config import (
     MODEL_NAME, N_CTX, N_THREADS, N_BATCH,
@@ -45,6 +58,20 @@ class RagEngine:
         self.n_batch = N_BATCH
         self.llm = self._load_model()
 
+        # Serializes all access to `self.llm`: it holds one native model context, so two
+        # generate() calls running at once (e.g. an interactive chat turn racing the
+        # background PDF-scan thread from app.api.documents) would corrupt each other's
+        # state. Also guards the persistent elicitation chat session below.
+        self._llm_lock = threading.Lock()
+
+        # Elicitation turns are kept in a persistent GPT4All chat_session (see
+        # _ensure_elicitation_session) so the model's KV cache carries over between
+        # consecutive turns of the SAME session instead of reprocessing the whole
+        # conversation from scratch on every message - only a session switch (or an
+        # Audit/Finalize/scan call needing a stateless context) pays that cost again.
+        self._chat_stack = ExitStack()
+        self._active_elicitation_session = None
+
     def _load_model(self):
         """Loads the GGUF model, preferring GPU acceleration when available and
         falling back to CPU on any failure (e.g. insufficient VRAM, no matching
@@ -52,7 +79,8 @@ class RagEngine:
         print("--- LOADING AI MODEL (GPT4All) ---")
         for gpu_device in self._gpu_device_candidates():
             try:
-                llm = GPT4All(MODEL_NAME, device=gpu_device, n_threads=self.n_threads, n_ctx=N_CTX)
+                with self._suppress_native_stderr():
+                    llm = GPT4All(MODEL_NAME, device=gpu_device, n_threads=self.n_threads, n_ctx=N_CTX)
                 print(f"--- MODEL LOADED on GPU (device={llm.device or gpu_device}) ---")
                 return llm
             except Exception as e:
@@ -62,9 +90,40 @@ class RagEngine:
         print("--- MODEL LOADED on CPU ---")
         return llm
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _suppress_native_stderr():
+        """Temporarily redirects the OS-level stderr file descriptor to null.
+
+        GPT4All's native backend loader writes DLL-load failures (e.g. a CUDA runtime that's
+        missing, or present in the wrong version - `cuda_found` above only catches the former)
+        directly to the process's stderr file descriptor, bypassing Python's `sys.stderr`
+        object entirely - a try/except around the failing call stops the exception, but does
+        nothing to stop that print. Only wraps the speculative GPU attempts in _load_model,
+        which already surface failure through the normal Python exception regardless of what
+        the native side wrote, so nothing of value is lost by discarding it.
+
+        Falls back to not suppressing anything if stderr isn't a redirectable OS file
+        descriptor (e.g. some IDE/service runners) rather than breaking model loading over it.
+        """
+        try:
+            stderr_fd = sys.stderr.fileno()
+            saved_fd = os.dup(stderr_fd)
+        except (AttributeError, OSError, ValueError):
+            yield
+            return
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, stderr_fd)
+            yield
+        finally:
+            os.dup2(saved_fd, stderr_fd)
+            os.close(devnull_fd)
+            os.close(saved_fd)
+
     def _gpu_device_candidates(self):
         """Yields GPT4All `device` strings to attempt GPU acceleration with, in
-        order of preference.
+        order of preference. CPU is always tried after these (see _load_model).
 
         Deliberately does NOT use `GPT4All.list_gpus()` to pre-detect a device:
         that static probe initializes a Kompute/Vulkan context as a side effect,
@@ -75,15 +134,20 @@ class RagEngine:
         both the detection and the fallback: an unavailable backend (e.g. no
         NVIDIA CUDA runtime installed) raises a normal, catchable exception here.
 
-        Native CUDA is meaningfully faster than the Kompute/Vulkan fallback for
-        NVIDIA cards, so it's tried first; Kompute is the broad-compatibility
-        fallback that also covers AMD/Intel GPUs and NVIDIA cards without the
-        matching CUDA runtime installed."""
+        Only CUDA (NVIDIA) and Metal (Apple Silicon) are offered - both are
+        first-class, well-tuned llama.cpp backends. Kompute (the Vulkan fallback
+        that also covers AMD/Intel GPUs) is deliberately NOT tried automatically:
+        benchmarked on an AMD Radeon 880M iGPU, decode throughput was ~0.58s/token
+        via Kompute vs. ~0.06s/token on CPU on the very same machine - roughly
+        10x SLOWER, not faster. Kompute is a bare-compatibility shim, not a tuned
+        backend like the other two, and there's no reliable way to know in
+        advance whether it'll help or hurt on a given GPU, so CPU is the safer
+        default for anything that isn't CUDA or Metal."""
         if sys.platform == "darwin":
             yield "gpu"  # Metal
             return
-        yield "cuda"
-        yield "kompute"
+        if cuda_found:
+            yield "cuda"
 
     def _make_stop_callback(self):
         """Builds a fresh per-token callback that halts generation as soon as a
@@ -136,6 +200,62 @@ class RagEngine:
             f"<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
 
+    def _build_turn_prompt(self, state_instruction, context_text, user_query):
+        """Builds just the NEW content for one elicitation turn - state instruction,
+        retrieval context, and the user's message - to be appended to the model's
+        already-cached context by _ensure_elicitation_session's persistent chat
+        session, instead of resending the whole conversation every turn like
+        _build_full_prompt does for the stateless Audit path."""
+        return (
+            f"<|start_header_id|>system<|end_header_id|>\n\n"
+            f"{state_instruction}\n\n"
+            f"CONTEXT (PDFs):\n{context_text}<|eot_id|>\n"
+            f"<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{user_query}<|eot_id|>\n"
+            f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    def _ensure_elicitation_session(self, session_id, active_prompt, history):
+        """(Re)opens a persistent GPT4All chat session bound to `session_id` so
+        consecutive Elicitation turns of the SAME conversation reuse the model's
+        KV cache (only the new turn's text gets tokenized/evaluated) instead of
+        reprocessing the whole growing conversation from scratch every time -
+        see _build_turn_prompt for what's actually sent per turn.
+
+        Must be called with `self._llm_lock` held. A no-op if this session is
+        already the one live in the model's context. Switching to a different
+        session (including the first call ever) pays a one-time reprocessing
+        cost, same as before the KV-cache reuse was added: the recent
+        conversation history is replayed once here so the model doesn't lose
+        context it already had in the database."""
+        if self._active_elicitation_session == session_id:
+            return
+
+        same_intent_history = [m for m in (history or []) if m.get("intent") == "elicitation"]
+        history_text = self._format_history(same_intent_history)
+        system_prompt = (
+            f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{active_prompt}<|eot_id|>\n"
+            f"{history_text}"
+        )
+
+        self._chat_stack.close()
+        self._chat_stack = ExitStack()
+        # prompt_template="{0}" means "use the turn text as-is" - _build_turn_prompt
+        # already hand-formats the Llama-3 special tokens, so no extra wrapping is wanted.
+        self._chat_stack.enter_context(self.llm.chat_session(system_prompt=system_prompt, prompt_template="{0}"))
+        self._active_elicitation_session = session_id
+
+    def _close_elicitation_session(self):
+        """Force-closes any persistent elicitation chat session so a stateless call
+        (Audit, Finalize, document scanning) never inherits its leftover history or
+        KV-cache context - see the module docstring's note on Audit needing to stay
+        a stateless one-shot tool. Must be called with `self._llm_lock` held."""
+        if self._active_elicitation_session is not None:
+            self._chat_stack.close()
+            self._chat_stack = ExitStack()
+            self._active_elicitation_session = None
+
     def generate_response(self, user_query: str, session_id: str, intent: str = "elicitation", process_state: str = "Asset", history=None):
         """Generates one chat-turn response. `intent` selects the persona
         (elicitation guidance vs. audit scoring, see app.core.prompts); `process_state`
@@ -171,64 +291,78 @@ class RagEngine:
         if intent != "audit":
             state_instruction += f"\nSTYLE HINT: {random.choice(STYLE_HINTS)}\n"
 
-        # 4. Build Prompt (with prior conversation turns so the model keeps context).
-        # History is only meaningful for the guided Elicitation flow. Audit mode is meant to be
-        # a stateless one-shot scoring tool (see AUDIT_PROMPT's CORE MISSION) - mixing in prior
-        # Elicitation-formatted turns was observed to make the small model imitate that format
-        # instead of producing an Audit Report, even though the correct system prompt was active.
-        # History is additionally filtered to turns tagged with the SAME intent as the current
-        # request (untagged/legacy turns are excluded) - a small model was found to imitate
-        # whichever format dominates recent history regardless of which system prompt is active,
-        # so an Elicitation request following Audit turns (or vice versa) needs its history scrubbed
-        # of the other mode's turns, not just Audit requests scrubbed of Elicitation history.
-        if intent == "audit":
-            history_text = ""
-        else:
-            same_intent_history = [m for m in (history or []) if m.get("intent") == intent]
-            history_text = self._format_history(same_intent_history)
-        full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, history_text, user_query)
-
-        # Defensively trim if the assembled prompt risks exceeding the model's context window,
-        # since GPT4All surfaces an overflow as plain generated text rather than a Python exception.
-        # Each step re-derives full_prompt from its components rather than slicing the assembled
-        # string directly, so the closing "<|start_header_id|>assistant<|end_header_id|>" turn-opener
-        # is never lost - a naive prefix-slice was observed to strip it, causing the model to echo
-        # raw system-prompt text back as its "answer" instead of generating a real response.
-        if len(full_prompt) > PROMPT_CHAR_BUDGET:
-            history_text = ""
-            full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, history_text, user_query)
-        if len(full_prompt) > PROMPT_CHAR_BUDGET:
-            context_text = context_text[:2000]
-            full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, history_text, user_query)
-        if len(full_prompt) > PROMPT_CHAR_BUDGET:
-            context_text = ""
-            full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, history_text, user_query)
-        if len(full_prompt) > PROMPT_CHAR_BUDGET:
-            # Last resort: the user_query itself is still too large for the budget. Shrink it
-            # directly (rather than slicing the assembled prompt) so prompt structure stays intact.
-            overshoot = len(full_prompt) - PROMPT_CHAR_BUDGET
-            user_query = user_query[:max(0, len(user_query) - overshoot)]
-            full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, history_text, user_query)
-
-        # 5. Generate
-        # Elicitation replies are meant to stay short (ONE question + 2-3 options per ELICITATION_PROMPT),
-        # so they get a tighter token cap than the longer, structured Audit Report - shorter cap means
-        # less decode time, which is the dominant cost of a turn on weaker CPU-only hardware.
+        # 4. Build Prompt & Generate.
+        # Audit mode is meant to be a stateless one-shot scoring tool (see AUDIT_PROMPT's CORE
+        # MISSION) - mixing in prior Elicitation-formatted turns was observed to make the small
+        # model imitate that format instead of producing an Audit Report, even though the correct
+        # system prompt was active. Elicitation, on the other hand, keeps a persistent chat session
+        # per `session_id` (see _ensure_elicitation_session) so the model's own KV cache carries the
+        # conversation forward - only the new turn's content needs to be built/sent here, not the
+        # whole history re-flattened into text every time.
         max_tokens = 400 if intent == "audit" else 250
         temp = AUDIT_TEMP if intent == "audit" else ELICITATION_TEMP
-        try:
-            response = self.llm.generate(
-                full_prompt,
-                max_tokens=max_tokens,
-                temp=temp,
-                top_k=40,
-                top_p=0.4,
-                n_batch=self.n_batch,
-                callback=self._make_stop_callback()
-            )
-        except Exception as e:
-            print(f"--- Generation error: {e} ---")
-            response = "⚠️ Sorry, something went wrong while generating a response. Please try again."
+
+        with self._llm_lock:
+            if intent == "audit":
+                self._close_elicitation_session()
+                full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, "", user_query)
+
+                # Defensively trim if the assembled prompt risks exceeding the model's context window,
+                # since GPT4All surfaces an overflow as plain generated text rather than a Python
+                # exception. Each step re-derives full_prompt from its components rather than slicing
+                # the assembled string directly, so the closing
+                # "<|start_header_id|>assistant<|end_header_id|>" turn-opener is never lost - a naive
+                # prefix-slice was observed to strip it, causing the model to echo raw system-prompt
+                # text back as its "answer" instead of generating a real response.
+                if len(full_prompt) > PROMPT_CHAR_BUDGET:
+                    context_text = context_text[:2000]
+                    full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, "", user_query)
+                if len(full_prompt) > PROMPT_CHAR_BUDGET:
+                    context_text = ""
+                    full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, "", user_query)
+                if len(full_prompt) > PROMPT_CHAR_BUDGET:
+                    # Last resort: the user_query itself is still too large for the budget. Shrink it
+                    # directly (rather than slicing the assembled prompt) so prompt structure stays intact.
+                    overshoot = len(full_prompt) - PROMPT_CHAR_BUDGET
+                    user_query = user_query[:max(0, len(user_query) - overshoot)]
+                    full_prompt = self._build_full_prompt(active_prompt, state_instruction, context_text, "", user_query)
+
+                prompt = full_prompt
+            else:
+                self._ensure_elicitation_session(session_id, active_prompt, history)
+                turn_prompt = self._build_turn_prompt(state_instruction, context_text, user_query)
+
+                # Same defensive trim as Audit above, minus the history_text step (there's no
+                # flattened history in a per-turn prompt to drop here - it already isn't one).
+                if len(turn_prompt) > PROMPT_CHAR_BUDGET:
+                    context_text = context_text[:2000]
+                    turn_prompt = self._build_turn_prompt(state_instruction, context_text, user_query)
+                if len(turn_prompt) > PROMPT_CHAR_BUDGET:
+                    context_text = ""
+                    turn_prompt = self._build_turn_prompt(state_instruction, context_text, user_query)
+                if len(turn_prompt) > PROMPT_CHAR_BUDGET:
+                    overshoot = len(turn_prompt) - PROMPT_CHAR_BUDGET
+                    user_query = user_query[:max(0, len(user_query) - overshoot)]
+                    turn_prompt = self._build_turn_prompt(state_instruction, context_text, user_query)
+
+                prompt = turn_prompt
+
+            try:
+                response = self.llm.generate(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temp=temp,
+                    top_k=40,
+                    top_p=0.4,
+                    n_batch=self.n_batch,
+                    callback=self._make_stop_callback()
+                )
+            except Exception as e:
+                print(f"--- Generation error: {e} ---")
+                response = "⚠️ Sorry, something went wrong while generating a response. Please try again."
+                # Don't leave a possibly-corrupted context marked as this session's live one -
+                # the next turn should pay the reset cost and start clean rather than build on it.
+                self._close_elicitation_session()
 
         response = self._clean_response(response)
 
@@ -263,19 +397,21 @@ class RagEngine:
             f"<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
 
-        try:
-            response = self.llm.generate(
-                full_prompt,
-                max_tokens=200,
-                temp=0.2,
-                top_k=40,
-                top_p=0.4,
-                n_batch=self.n_batch,
-                callback=self._make_stop_callback()
-            )
-        except Exception as e:
-            print(f"--- Finalize generation error: {e} ---")
-            return "⚠️ Sorry, something went wrong while summarizing. Please try again."
+        with self._llm_lock:
+            self._close_elicitation_session()
+            try:
+                response = self.llm.generate(
+                    full_prompt,
+                    max_tokens=200,
+                    temp=0.2,
+                    top_k=40,
+                    top_p=0.4,
+                    n_batch=self.n_batch,
+                    callback=self._make_stop_callback()
+                )
+            except Exception as e:
+                print(f"--- Finalize generation error: {e} ---")
+                return "⚠️ Sorry, something went wrong while summarizing. Please try again."
 
         return self._clean_response(response)
 
@@ -317,7 +453,12 @@ class RagEngine:
                 f"<|start_header_id|>assistant<|end_header_id|>\n\n["
             )
 
-            response = self.llm.generate(extraction_prompt, max_tokens=250, temp=0.1, n_batch=self.n_batch)
+            # Acquired/released per chunk (not once for the whole scan) so an interactive chat
+            # request queued behind this background scan only waits for the current chunk, not
+            # the entire document.
+            with self._llm_lock:
+                self._close_elicitation_session()
+                response = self.llm.generate(extraction_prompt, max_tokens=250, temp=0.1, n_batch=self.n_batch)
             full_response = "[" + response
 
             artifacts = []

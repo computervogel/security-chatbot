@@ -12,6 +12,13 @@ that would be an unrelated behavior change.
 """
 import os
 
+# sentence-transformers checks the HuggingFace Hub for the embedding model's metadata on
+# every startup, even though it's already cached locally after the first run - the HF server
+# then replies with a rate-limit reminder for unauthenticated requests, which huggingface_hub
+# logs as a warning. This only turns down that library's own log verbosity (errors still show);
+# it doesn't disable the metadata check or the first-run download itself.
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
 # --- Storage locations (relative to the working directory the app is started from) ---
 DB_NAME = "chat_history.db"
 CHROMA_DIR = "chroma_db"
