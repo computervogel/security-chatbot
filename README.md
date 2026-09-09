@@ -49,7 +49,7 @@ scripts/debug/          # small standalone scripts used during development
 
 - Python 3.12+ (developed and tested on Windows; should work on macOS/Linux as-is)
 - ~2 GB free disk space for the LLM (downloaded automatically on first run)
-- An NVIDIA GPU is optional — the app auto-detects and uses one if available, and otherwise falls back to CPU
+- A GPU is optional — the app auto-detects and uses one if available (NVIDIA via CUDA, AMD/Intel via Vulkan, Apple Silicon via Metal) and otherwise falls back to CPU
 
 ## Setup
 
@@ -76,15 +76,21 @@ scripts/debug/          # small standalone scripts used during development
    pip install -r requirements.txt
    ```
 
-4. **(Optional) Enable NVIDIA GPU acceleration**
+4. **(Optional) Enable GPU acceleration**
 
-   The app auto-detects a GPU and uses it automatically if the right runtime is present. On Windows/Linux with an NVIDIA card, install the CUDA-enabled extras (no separate CUDA Toolkit install needed - this pulls the matching runtime via pip):
+   The app auto-detects a GPU and uses it automatically - no configuration needed:
 
-   ```bash
-   pip install "gpt4all[cuda]"
-   ```
+   - **AMD / Intel GPUs (Windows/Linux)** and **NVIDIA GPUs without the CUDA runtime installed** use Vulkan (via GPT4All's Kompute backend) out of the box, with no extra install step.
+   - **Apple Silicon (M1/M2/M3/M4)** uses Metal out of the box.
+   - **NVIDIA GPUs** additionally get faster native CUDA support if you install the CUDA-enabled extras (no separate CUDA Toolkit install needed - this pulls the matching runtime via pip):
 
-   Without this, or without a supported GPU, the app runs on CPU automatically - no configuration needed either way.
+     ```bash
+     pip install "gpt4all[cuda]"
+     ```
+
+     Without this, an NVIDIA GPU still gets used via the Vulkan fallback above - this step just makes it faster.
+
+   Without any supported GPU, the app runs on CPU automatically.
 
 ## Running the app
 
