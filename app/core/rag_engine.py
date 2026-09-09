@@ -47,50 +47,43 @@ class RagEngine:
 
     def _load_model(self):
         """Loads the GGUF model, preferring GPU acceleration when available and
-        falling back to CPU on any failure (e.g. insufficient VRAM)."""
+        falling back to CPU on any failure (e.g. insufficient VRAM, no matching
+        backend installed)."""
         print("--- LOADING AI MODEL (GPT4All) ---")
-        gpu_device = self._pick_gpu_device()
-        llm = None
-        if gpu_device:
+        for gpu_device in self._gpu_device_candidates():
             try:
                 llm = GPT4All(MODEL_NAME, device=gpu_device, n_threads=self.n_threads, n_ctx=N_CTX)
                 print(f"--- MODEL LOADED on GPU (device={llm.device or gpu_device}) ---")
+                return llm
             except Exception as e:
-                # e.g. insufficient VRAM for this model - GPT4All docs warn the instance is unusable after this
-                print(f"--- GPU init failed ({e}) - falling back to CPU ---")
-                llm = None
+                print(f"--- GPU init failed for device={gpu_device!r} ({e}) - trying next ---")
 
-        if llm is None:
-            llm = GPT4All(MODEL_NAME, device="cpu", n_threads=self.n_threads, n_ctx=N_CTX)
-            print("--- MODEL LOADED on CPU ---")
+        llm = GPT4All(MODEL_NAME, device="cpu", n_threads=self.n_threads, n_ctx=N_CTX)
+        print("--- MODEL LOADED on CPU ---")
         return llm
 
-    def _pick_gpu_device(self):
-        """Returns a GPT4All `device` string to attempt GPU acceleration with, or
-        None if no GPU-capable backend is available/detectable.
+    def _gpu_device_candidates(self):
+        """Yields GPT4All `device` strings to attempt GPU acceleration with, in
+        order of preference.
 
-        On non-macOS, `list_gpus()` can report the same physical GPU under multiple
-        backends (e.g. both "kompute:..." and "cuda:..." for an NVIDIA card once the
-        CUDA runtime is available - see nvidia-cuda-runtime-cu11/nvidia-cublas-cu11,
-        which GPT4All auto-loads if installed). Native CUDA is meaningfully faster
-        than the Kompute/Vulkan fallback for NVIDIA cards, so it's preferred whenever
-        listed; Kompute remains the broad-compatibility fallback for AMD/Intel GPUs
-        or NVIDIA cards without the matching CUDA runtime installed."""
-        try:
-            gpus = GPT4All.list_gpus()
-        except Exception as e:
-            print(f"--- GPU detection failed ({e}) - will use CPU ---")
-            return None
-        if not gpus:
-            print("--- No GPU detected - will use CPU ---")
-            return None
-        print(f"--- GPU(s) detected: {gpus} ---")
+        Deliberately does NOT use `GPT4All.list_gpus()` to pre-detect a device:
+        that static probe initializes a Kompute/Vulkan context as a side effect,
+        and constructing a model with device="kompute" afterwards in the same
+        process hard-crashes the interpreter (`GGML_ASSERT ... s_kompute_context
+        == nullptr`, not a catchable Python exception) instead of just failing to
+        find a GPU. Trying each backend directly via the GPT4All constructor is
+        both the detection and the fallback: an unavailable backend (e.g. no
+        NVIDIA CUDA runtime installed) raises a normal, catchable exception here.
 
+        Native CUDA is meaningfully faster than the Kompute/Vulkan fallback for
+        NVIDIA cards, so it's tried first; Kompute is the broad-compatibility
+        fallback that also covers AMD/Intel GPUs and NVIDIA cards without the
+        matching CUDA runtime installed."""
         if sys.platform == "darwin":
-            return "gpu"  # Metal
-        if any(g.startswith("cuda:") for g in gpus):
-            return "cuda"
-        return "kompute"
+            yield "gpu"  # Metal
+            return
+        yield "cuda"
+        yield "kompute"
 
     def _make_stop_callback(self):
         """Builds a fresh per-token callback that halts generation as soon as a
